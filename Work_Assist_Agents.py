@@ -1,5 +1,4 @@
 import streamlit as st
-import anthropic
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -10,6 +9,7 @@ from datetime import datetime, timedelta
 import re
 from typing import Dict, List, Any
 import base64
+import requests
 
 # Configure page
 st.set_page_config(
@@ -65,7 +65,7 @@ st.markdown("""
 
 class MultiAgentAssistant:
     def __init__(self, api_key: str):
-        self.client = anthropic.Anthropic(api_key=api_key)
+        self.api_key = api_key
         self.agents = {
             "📋 Checksheet Specialist": {
                 "description": "Creates comprehensive checklists, audit forms, and quality control sheets",
@@ -135,13 +135,33 @@ class MultiAgentAssistant:
         """
         
         try:
-            response = self.client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=4000,
-                temperature=0.7,
-                messages=[{"role": "user", "content": full_prompt}]
+            # Use Claude API via requests since anthropic package might not be available
+            headers = {
+                "Content-Type": "application/json",
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01"
+            }
+            
+            data = {
+                "model": "claude-3-sonnet-20240229",
+                "max_tokens": 4000,
+                "temperature": 0.7,
+                "messages": [{"role": "user", "content": full_prompt}]
+            }
+            
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=data,
+                timeout=30
             )
-            return response.content[0].text
+            
+            if response.status_code == 200:
+                result = response.json()
+                return result["content"][0]["text"]
+            else:
+                return f"Error: {response.status_code} - {response.text}"
+                
         except Exception as e:
             return f"Error getting response from {agent_name}: {str(e)}"
 
@@ -219,6 +239,12 @@ def main():
     # Header
     st.markdown('<h1 class="main-header">🤖 Multi-Agent Workplace Assistant</h1>', unsafe_allow_html=True)
     
+    # Initialize session state
+    if 'tasks' not in st.session_state:
+        st.session_state.tasks = []
+    if 'assistant' not in st.session_state:
+        st.session_state.assistant = None
+    
     # Sidebar for configuration
     with st.sidebar:
         st.header("🔧 Configuration")
@@ -229,40 +255,50 @@ def main():
         
         if not api_key:
             st.warning("⚠️ Please enter your Claude API key to use the agents")
-            st.stop()
-        
-        # Initialize assistant
-        try:
-            assistant = MultiAgentAssistant(api_key)
-            st.success("✅ Connected to Claude API")
-        except Exception as e:
-            st.error(f"❌ Failed to connect: {str(e)}")
-            st.stop()
+            # Don't stop the app, just disable agent functionality
+            agent_available = False
+        else:
+            try:
+                if st.session_state.assistant is None or st.session_state.assistant.api_key != api_key:
+                    st.session_state.assistant = MultiAgentAssistant(api_key)
+                st.success("✅ API Key provided")
+                agent_available = True
+            except Exception as e:
+                st.error(f"❌ Error with API key: {str(e)}")
+                agent_available = False
         
         st.divider()
         
         # Agent selection
         st.header("🤖 Select Agent")
-        selected_agent = st.selectbox(
-            "Choose an agent:",
-            list(assistant.agents.keys()),
-            help="Select the most appropriate agent for your task"
-        )
-        
-        # Display agent info
-        agent_info = assistant.agents[selected_agent]
-        st.markdown(f"""
-        <div class="agent-card">
-            <h4>{selected_agent}</h4>
-            <p>{agent_info['description']}</p>
-        </div>
-        """, unsafe_allow_html=True)
+        if agent_available:
+            selected_agent = st.selectbox(
+                "Choose an agent:",
+                list(st.session_state.assistant.agents.keys()),
+                help="Select the most appropriate agent for your task"
+            )
+            
+            # Display agent info
+            agent_info = st.session_state.assistant.agents[selected_agent]
+            st.markdown(f"""
+            <div class="agent-card">
+                <h4>{selected_agent}</h4>
+                <p>{agent_info['description']}</p>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.info("Enter API key to select agents")
+            selected_agent = None
     
     # Main content area
     tab1, tab2, tab3, tab4 = st.tabs(["🎯 Problem Solver", "📊 Dashboard", "📋 Task Manager", "💡 Knowledge Base"])
     
     with tab1:
         st.header("🎯 Problem Solver")
+        
+        if not agent_available:
+            st.warning("⚠️ Please enter your Claude API key in the sidebar to use the Problem Solver")
+            return
         
         col1, col2 = st.columns([2, 1])
         
@@ -290,9 +326,9 @@ def main():
             
             # Submit button
             if st.button("🚀 Get Agent Assistance", type="primary"):
-                if problem_description:
+                if problem_description and selected_agent:
                     with st.spinner(f"🤖 {selected_agent} is analyzing your problem..."):
-                        response = assistant.get_agent_response(
+                        response = st.session_state.assistant.get_agent_response(
                             selected_agent, 
                             problem_description, 
                             f"Priority: {priority}, Urgency: {urgency}. {additional_context}"
@@ -303,9 +339,6 @@ def main():
                     st.markdown(response)
                     
                     # Save to session state for task manager
-                    if 'tasks' not in st.session_state:
-                        st.session_state.tasks = []
-                    
                     task = {
                         'id': len(st.session_state.tasks) + 1,
                         'title': problem_description[:50] + "..." if len(problem_description) > 50 else problem_description,
@@ -318,8 +351,10 @@ def main():
                     }
                     st.session_state.tasks.append(task)
                     
-                else:
+                elif not problem_description:
                     st.warning("⚠️ Please describe your problem or task")
+                elif not selected_agent:
+                    st.warning("⚠️ Please select an agent")
         
         with col2:
             st.markdown("### 🎯 Quick Actions")
@@ -337,7 +372,9 @@ def main():
             
             for action in quick_actions:
                 if st.button(action, key=f"quick_{action}"):
-                    st.text_area("Quick task:", value=action, key=f"task_{action}")
+                    # Auto-fill the problem description with the quick action
+                    st.session_state[f"quick_action_{action}"] = action
+                    st.rerun()
     
     with tab2:
         st.header("📊 Performance Dashboard")
@@ -346,9 +383,6 @@ def main():
     
     with tab3:
         st.header("📋 Task Manager")
-        
-        if 'tasks' not in st.session_state:
-            st.session_state.tasks = []
         
         if st.session_state.tasks:
             st.markdown("### 📝 Recent Tasks")
@@ -367,18 +401,23 @@ def main():
                     
                     st.markdown("**Response:**")
                     st.markdown(task['response'][:500] + "..." if len(task['response']) > 500 else task['response'])
+            
+            if st.button("🗑️ Clear All Tasks"):
+                st.session_state.tasks = []
+                st.rerun()
         else:
             st.info("📝 No tasks yet. Use the Problem Solver tab to create your first task!")
     
     with tab4:
         st.header("💡 Knowledge Base")
         
-        st.markdown("### 🤖 Available Agents")
-        
-        for agent_name, agent_info in assistant.agents.items():
-            with st.expander(agent_name):
-                st.markdown(f"**Description:** {agent_info['description']}")
-                st.markdown(f"**Specialization:** {agent_info['prompt_prefix']}")
+        if agent_available:
+            st.markdown("### 🤖 Available Agents")
+            
+            for agent_name, agent_info in st.session_state.assistant.agents.items():
+                with st.expander(agent_name):
+                    st.markdown(f"**Description:** {agent_info['description']}")
+                    st.markdown(f"**Specialization:** {agent_info['prompt_prefix']}")
         
         st.markdown("### 📚 Best Practices")
         
